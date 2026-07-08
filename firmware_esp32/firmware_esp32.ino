@@ -9,13 +9,23 @@
  *   0x18  LIS2DH12  3-axis accelerometer     (SparkFun_LIS2DH12)
  *   0x2E  MCP4531   TIA gain digipot         (raw I2C)
  *   0x2F  MCP4018   SiPM overvoltage digipot (raw I2C)
- *   0x48  ADS1115   16-bit ADC, TIA output   (Adafruit_ADS1X15)
+ *   0x48  ADS1115   16-bit ADC, AIN0 = /AMP_OUT (TIA)   (Adafruit_ADS1X15)
  *
  * GPIO:
  *   18  HV_EN    high-voltage enable (LOW = off / safe)
  *   16  LED1     green LED #1, PWM via MOSFET
  *   17  LED2     green LED #2, PWM via MOSFET
- *   25  DAC_ALC  8-bit DAC, DC-offset injection at the amplifier input
+ *   25  DAC_ALC  8-bit DAC, DC-offset injection (DISABLED: TIA ref now 3.3V)
+ *
+ * Analog front-end (rev. virtual ground):
+ *   TIA non-inverting input sits at 3.3 V (not GND). Dark = high ADC counts;
+ *   pulse absorbs light -> counts fall. Firmware inverts before streaming so
+ *   the host sees conventional PPG (pulse = rising).
+ *
+ * SiPM bias (MCP4018 / LT3905):
+ *   Anode is at 3.3 V, so cathode HV must be ~3.3 V higher than the old
+ *   0 V-referenced setup to keep ~28 V overvoltage. DEFAULT_BOOST targets
+ *   ~31.5 V cathode (~28 V across the SiPM).
  *
  * Serial protocol @115200:
  *   ESP32 -> host : "led1,led2,ax,ay,az\n"   (both PPG columns share one channel)
@@ -41,20 +51,16 @@ constexpr uint8_t  PWM_RES_BITS = 8;
 constexpr uint32_t SAMPLE_RATE_HZ = 250;
 constexpr uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE_HZ;
 constexpr uint8_t  DEFAULT_ADS_GAIN = 5;   // index 5 = +/-256 mV, ~7.8 uV/LSB
+constexpr int16_t  ADS_SINGLE_ENDED_MAX = 32767;  // max positive code, MUX vs GND
+constexpr uint8_t  DEFAULT_BOOST = 76;   // ~31.5 V cathode (was 64/~28 V at 0 V anode)
 
 // ADS1115 full-scale per gain index; higher index = finer resolution.
 static const adsGain_t ADS_GAIN_TABLE[] = {
     GAIN_TWOTHIRDS, GAIN_ONE, GAIN_TWO, GAIN_FOUR, GAIN_EIGHT, GAIN_SIXTEEN};
 
-// ---- Software DC servo (optional) ----
-// Nudges the DAC to keep the DC level near mid-scale. Note: on this board the
-// DAC only shifts the reading by ~15 counts full-swing, so it cannot fully
-// cancel the DC. Kept as an option; DC is normally removed on the host side.
-constexpr float    DC_SERVO_TARGET   = 16000.0f;
-constexpr float    DC_SERVO_ALPHA    = 0.004f;    // ~0.15 Hz low-pass at 250 Hz
-constexpr float    DC_SERVO_KP       = 0.0008f;   // error (counts) -> DAC steps
-constexpr int      DC_SERVO_MAX_STEP = 3;
-constexpr uint32_t DC_SERVO_PERIOD_US = 40000;    // update DAC at ~25 Hz
+// ---- Software DC servo (disabled) ----
+// Designed for 0 V TIA reference; unsafe/irrelevant with 3.3 V virtual ground.
+// DAC_ALC is held at 0. DCSERVO commands are ignored.
 
 // ---- Devices ----
 Adafruit_ADS1115 ads;
@@ -66,16 +72,13 @@ bool lisReady = false;
 uint8_t ledLevel1  = 48;
 uint8_t ledLevel2  = 48;
 uint8_t tiaGain    = 128;
-uint8_t boost      = 64;
-uint8_t dacOffset  = 128;
+uint8_t boost      = DEFAULT_BOOST;
+uint8_t dacOffset  = 0;
 uint8_t adsGainIdx = DEFAULT_ADS_GAIN;
 bool    hvEnabled  = false;
 
-// ---- DC servo state ----
-bool     dcServoEnabled = false;
-float    dcEstimate     = DC_SERVO_TARGET;
-int8_t   dcServoSign    = +1;              // DAC->ADC polarity, set on enable
-uint32_t dcLastUpdateUs = 0;
+// DC servo permanently off (see header).
+bool dcServoEnabled = false;
 
 // ---- Serial command buffer ----
 char    cmdBuf[64];
@@ -102,7 +105,11 @@ static void writeMCP4018(uint8_t value) {
 // ---------------------------------------------------------------------------
 static void setTiaGain(uint8_t v)   { tiaGain = v;      writeMCP4531(v); }
 static void setBoost(uint8_t v)     { boost = v & 0x7F; writeMCP4018(boost); }
-static void setDacOffset(uint8_t v) { dacOffset = v;    dacWrite(PIN_DAC_ALC, v); }
+static void setDacOffset(uint8_t v) {
+  (void)v;
+  dacOffset = 0;
+  dacWrite(PIN_DAC_ALC, 0);
+}
 static void setHighVoltage(bool en) { hvEnabled = en;   digitalWrite(PIN_HV_EN, en ? HIGH : LOW); }
 
 static void setLeds(uint8_t l1, uint8_t l2) {
@@ -124,33 +131,10 @@ static int16_t readAdc() {
   return adsReady ? ads.getLastConversionResults() : 0;
 }
 
-// ---------------------------------------------------------------------------
-// DC servo
-// ---------------------------------------------------------------------------
-// Learn whether raising the DAC raises or lowers the ADC reading.
-static void calibrateDcServo() {
-  if (!adsReady) return;
-  setDacOffset(90);  delay(120);
-  long lo = 0; for (int i = 0; i < 8; ++i) { lo += readAdc(); delay(3); }
-  setDacOffset(170); delay(120);
-  long hi = 0; for (int i = 0; i < 8; ++i) { hi += readAdc(); delay(3); }
-  dcServoSign = (hi >= lo) ? +1 : -1;
-  setDacOffset(128);
-  dcEstimate = DC_SERVO_TARGET;
-}
-
-// Update the slow DC estimate every sample; move the DAC when the servo is on.
-static void updateDcServo(int16_t adc, uint32_t now) {
-  dcEstimate += DC_SERVO_ALPHA * ((float)adc - dcEstimate);
-
-  if (!dcServoEnabled) return;
-  if ((uint32_t)(now - dcLastUpdateUs) < DC_SERVO_PERIOD_US) return;
-  dcLastUpdateUs = now;
-
-  int step = (int)(DC_SERVO_KP * (DC_SERVO_TARGET - dcEstimate));
-  step = constrain(step, -DC_SERVO_MAX_STEP, DC_SERVO_MAX_STEP);
-  int next = constrain((int)dacOffset + dcServoSign * step, 0, 255);
-  if (next != (int)dacOffset) setDacOffset((uint8_t)next);
+// Invert single-ended reading: dark was near +FS, pulse drives toward 0 V.
+static int16_t invertPpgSingleEnded(int16_t raw) {
+  int32_t clamped = constrain((int32_t)raw, 0, (int32_t)ADS_SINGLE_ENDED_MAX);
+  return (int16_t)(ADS_SINGLE_ENDED_MAX - clamped);
 }
 
 // ---------------------------------------------------------------------------
@@ -163,8 +147,7 @@ static void printStatus() {
   Serial.print(" adsgain=");      Serial.print(adsGainIdx);
   Serial.print(" led1=");         Serial.print(ledLevel1);
   Serial.print(" led2=");         Serial.print(ledLevel2);
-  Serial.print(" dcservo=");      Serial.print(dcServoEnabled ? 1 : 0);
-  Serial.print(" dcest=");        Serial.print((int)dcEstimate);
+  Serial.print(" dcservo=");      Serial.print(0);
   Serial.print(" hv=");           Serial.println(hvEnabled ? 1 : 0);
 }
 
@@ -182,16 +165,20 @@ static void handleCommand(char *line) {
   }
   for (char *p = line; *p; ++p) *p = toupper(*p);
 
-  if      (!strcmp(line, "GAIN")    && hasValue) setTiaGain(constrain(value, 0, 255));
+  if      (!strcmp(line, "GAIN")    && hasValue) setTiaGain(constrain(value, 0, 128));
   else if (!strcmp(line, "BOOST")   && hasValue) setBoost(constrain(value, 0, 127));
-  else if (!strcmp(line, "DAC")     && hasValue) setDacOffset(constrain(value, 0, 255));
+  else if (!strcmp(line, "DAC")     && hasValue) {
+    if (value != 0) Serial.println("# WARN: DAC disabled (3.3V TIA ref); held at 0");
+    setDacOffset(0);
+  }
   else if (!strcmp(line, "ADSGAIN") && hasValue) setAdsGain(constrain(value, 0, 5));
   else if (!strcmp(line, "LED1")    && hasValue) setLeds(constrain(value, 0, 255), ledLevel2);
   else if (!strcmp(line, "LED2")    && hasValue) setLeds(ledLevel1, constrain(value, 0, 255));
   else if (!strcmp(line, "HVEN")    && hasValue) setHighVoltage(value != 0);
   else if (!strcmp(line, "DCSERVO") && hasValue) {
-    dcServoEnabled = (value != 0);
-    if (dcServoEnabled) calibrateDcServo();
+    if (value != 0) Serial.println("# WARN: DC servo disabled (3.3V TIA ref)");
+    dcServoEnabled = false;
+    setDacOffset(0);
   }
   else if (!strcmp(line, "PING")) printStatus();
   else { Serial.print("# ERR unknown cmd: "); Serial.println(line); }
@@ -271,10 +258,8 @@ void loop() {
   if ((int32_t)(now - nextSampleUs) < 0) return;
   nextSampleUs = now + SAMPLE_PERIOD_US;
 
-  // PPG: latest continuous conversion (non-blocking). LEDs are always on, so
-  // every conversion is valid and there is no LED-switching artifact.
-  int16_t ppg = readAdc();
-  updateDcServo(ppg, now);
+  // PPG: invert so pulse (less light at TIA out) appears as rising counts.
+  int16_t ppg = invertPpgSingleEnded(readAdc());
 
   // Accelerometer: read only when a new sample is ready so getX() never blocks.
   if (lisReady && lis.available()) {

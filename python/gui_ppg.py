@@ -22,7 +22,7 @@ import serial
 import serial.tools.list_ports
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ppg_agc import AutoTuner, BoostOptimizer
+from ppg_agc import ADC_FULL_SCALE, AutoTuner, BoostOptimizer
 from ppg_pipeline import PpgHrProcessor, PpgMode
 
 BAUDRATE = 115200
@@ -30,6 +30,15 @@ PLOT_SECONDS = 8
 NOMINAL_FS = 250
 BUFFER_LEN = PLOT_SECONDS * NOMINAL_FS
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
+
+# ADS1115 single-ended full-scale (mV) per ADSGAIN index 0-5.
+ADS_FSR_MV = (6144.0, 4096.0, 2048.0, 1024.0, 512.0, 256.0)
+
+
+def adc_counts_to_mv(counts: float, adsgain: int) -> float:
+    """Convert raw ADS1115 counts (AIN0 vs GND) to millivolts."""
+    idx = int(np.clip(adsgain, 0, 5))
+    return float(counts) * ADS_FSR_MV[idx] / 32768.0
 
 
 def _ensure_qt_plugins_visible() -> None:
@@ -266,9 +275,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motion_btn.toggled.connect(
             lambda c: setattr(self.hr_proc, "use_motion_cancel", c))
 
-        self.dc_servo_btn = QtWidgets.QCheckBox("Firmware DC servo (limited DAC authority)")
+        self.dc_servo_btn = QtWidgets.QCheckBox("Firmware DC servo (disabled: 3.3V TIA ref)")
         self.dc_servo_btn.setChecked(False)
-        self.dc_servo_btn.toggled.connect(self._toggle_dc_servo)
+        self.dc_servo_btn.setEnabled(False)
 
         self.center_display_btn = QtWidgets.QCheckBox("Center raw plot (remove DC for display)")
         self.center_display_btn.setChecked(True)
@@ -320,6 +329,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.snr_label = QtWidgets.QLabel("SNR: --")
         self.snr_label.setAlignment(QtCore.Qt.AlignCenter)
         self.snr_label.setStyleSheet("color:#666;font-size:12px;")
+        self.adc_v_label = QtWidgets.QLabel("AIN0 voltage: --")
+        self.adc_v_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.adc_v_label.setStyleSheet("color:#2c3e50;font-size:13px;font-weight:bold;")
+        self.snr_label = QtWidgets.QLabel("SNR: --")
+        self.snr_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.snr_label.setStyleSheet("color:#666;font-size:12px;")
         self.ac_label = QtWidgets.QLabel("AC amplitude: --")
         self.ac_label.setAlignment(QtCore.Qt.AlignCenter)
         self.ac_label.setStyleSheet("color:#666;font-size:12px;")
@@ -327,7 +342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motion_label.setAlignment(QtCore.Qt.AlignCenter)
         self.motion_label.setStyleSheet("color:#666;font-size:12px;")
 
-        for w in (self.bpm_label, self.bpm_unit, self.snr_label,
+        for w in (self.bpm_label, self.bpm_unit, self.adc_v_label, self.snr_label,
                   self.ac_label, self.motion_label):
             lay.addWidget(w)
         return box
@@ -336,9 +351,11 @@ class MainWindow(QtWidgets.QMainWindow):
         box = QtWidgets.QGroupBox("Hardware controls")
         lay = QtWidgets.QVBoxLayout(box)
 
-        self.sl_gain = CommandSlider("TIA gain (MCP4531)", "GAIN", 0, 255, 210, self._send)
-        self.sl_boost = CommandSlider("SiPM bias (MCP4018)", "BOOST", 0, 127, 64, self._send)
-        self.sl_dac = CommandSlider("DC offset (DAC)", "DAC", 0, 255, 128, self._send)
+        self.sl_gain = CommandSlider("TIA gain (MCP4531)", "GAIN", 0, 128, 64, self._send)
+        self.sl_boost = CommandSlider(
+            "SiPM bias (MCP4018, ~31.5V cathode)", "BOOST", 0, 127, 76, self._send)
+        self.sl_dac = CommandSlider("DC offset (DAC, disabled)", "DAC", 0, 255, 0, self._send)
+        self.sl_dac.setEnabled(False)
         self.sl_adsgain = CommandSlider("ADC gain (ADSGAIN 0-5)", "ADSGAIN", 0, 5, 5, self._send)
         self.sl_led1 = CommandSlider("LED 1 brightness", "LED1", 0, 255, 48, self._send)
         self.sl_led2 = CommandSlider("LED 2 brightness", "LED2", 0, 255, 48, self._send)
@@ -409,7 +426,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._send(f"ADSGAIN:{self.sl_adsgain.slider.value()}")
             self._send(f"GAIN:{self.sl_gain.slider.value()}")
-            self._send(f"DCSERVO:{1 if self.dc_servo_btn.isChecked() else 0}")
+            self._send("DCSERVO:0")
+            self._send("DAC:0")
+            self._send(f"BOOST:{self.sl_boost.slider.value()}")
             self._send(f"LED1:{self.sl_led1.slider.value()}")
             self._send(f"LED2:{self.sl_led2.slider.value()}")
         else:
@@ -449,9 +468,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.auto_status.setText("Auto-tuning: off")
 
     def _toggle_dc_servo(self, checked: bool):
+        if checked:
+            self.dc_servo_btn.setChecked(False)
         if self.reader:
-            self._send(f"DCSERVO:{1 if checked else 0}")
-        self._log(f"# DC servo: {'ON' if checked else 'OFF'}")
+            self._send("DCSERVO:0")
+            self._send("DAC:0")
+        self._log("# DC servo disabled (3.3V TIA virtual ground)")
 
     def _toggle_boost_opt(self, checked: bool):
         self.boost_opt_enabled = checked
@@ -636,8 +658,17 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.snr_label.setText("SNR: --")
 
+        gain_idx = self.sl_adsgain.slider.value()
+        ppg_counts = float(ppg[-1])
+        pin_counts = ADC_FULL_SCALE - ppg_counts
+        pin_mv = adc_counts_to_mv(pin_counts, gain_idx)
+        self.adc_v_label.setText(
+            f"AIN0 pin: {pin_mv:.3f} mV  |  PPG: {ppg_counts:.0f} counts (inverted)")
+
         if self.current_ac_amp > 0:
-            self.ac_label.setText(f"AC amplitude: {self.current_ac_amp:.1f} counts")
+            ac_mv = adc_counts_to_mv(self.current_ac_amp, gain_idx)
+            self.ac_label.setText(
+                f"AC amplitude: {self.current_ac_amp:.1f} counts ({ac_mv:.3f} mV pk)")
         else:
             self.ac_label.setText("AC amplitude: --")
 

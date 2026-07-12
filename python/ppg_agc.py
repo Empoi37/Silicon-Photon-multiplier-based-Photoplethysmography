@@ -18,7 +18,7 @@ class AutoTuner:
 
     led: int = 48
     gain_tia: int = 128
-    ads_gain: int = 5
+    ads_gain: int = 0
 
     led_min: int = 4
     led_max: int = 255
@@ -111,9 +111,9 @@ class AutoTuner:
 class BoostOptimizer:
     """Hill-climbing search for the SiPM overvoltage (BOOST) that maximizes in-band SNR."""
 
-    boost: int = 76
+    boost: int = 63
     boost_min: int = 16
-    boost_max: int = 110
+    boost_max: int = 127
     step: int = 6
     quality_margin: float = 0.08
     settle_ticks: int = 6
@@ -125,7 +125,7 @@ class BoostOptimizer:
     _ticks: int = 0
     _samples: list = field(default_factory=list)
     _best_quality: float = -1.0
-    _best_boost: int = 76
+    _best_boost: int = 63
     _reversals: int = 0
     _converged_wait: int = 0
 

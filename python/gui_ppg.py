@@ -351,14 +351,14 @@ class MainWindow(QtWidgets.QMainWindow):
         box = QtWidgets.QGroupBox("Hardware controls")
         lay = QtWidgets.QVBoxLayout(box)
 
-        self.sl_gain = CommandSlider("TIA gain (MCP4531)", "GAIN", 0, 128, 64, self._send)
+        self.sl_gain = CommandSlider("TIA gain (MCP4531)", "GAIN", 0, 128, 34, self._send)
         self.sl_boost = CommandSlider(
-            "SiPM bias (MCP4018, ~31.5V cathode)", "BOOST", 0, 127, 76, self._send)
+            "SiPM bias (MCP4018, ~31.5V cathode)", "BOOST", 0, 127, 63, self._send)
         self.sl_dac = CommandSlider("DC offset (DAC, disabled)", "DAC", 0, 255, 0, self._send)
         self.sl_dac.setEnabled(False)
-        self.sl_adsgain = CommandSlider("ADC gain (ADSGAIN 0-5)", "ADSGAIN", 0, 5, 5, self._send)
-        self.sl_led1 = CommandSlider("LED 1 brightness", "LED1", 0, 255, 48, self._send)
-        self.sl_led2 = CommandSlider("LED 2 brightness", "LED2", 0, 255, 48, self._send)
+        self.sl_adsgain = CommandSlider("ADC gain (ADSGAIN 0-5)", "ADSGAIN", 0, 5, 0, self._send)
+        self.sl_led1 = CommandSlider("LED 1 brightness", "LED1", 0, 255, 115, self._send)
+        self.sl_led2 = CommandSlider("LED 2 brightness", "LED2", 0, 255, 118, self._send)
 
         for w in (self.sl_gain, self.sl_boost, self.sl_dac, self.sl_adsgain,
                   self.sl_led1, self.sl_led2):
@@ -370,8 +370,9 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(box)
         self.hv_btn = QtWidgets.QPushButton("ENABLE HIGH VOLTAGE")
         self.hv_btn.setCheckable(True)
+        self.hv_btn.setChecked(True)
         self.hv_btn.setMinimumHeight(48)
-        self._style_hv_button(False)
+        self._style_hv_button(True)
         self.hv_btn.clicked.connect(self._toggle_hv)
         lay.addWidget(self.hv_btn)
         return box
@@ -431,6 +432,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._send(f"BOOST:{self.sl_boost.slider.value()}")
             self._send(f"LED1:{self.sl_led1.slider.value()}")
             self._send(f"LED2:{self.sl_led2.slider.value()}")
+            self._send(f"HVEN:{1 if self.hv_btn.isChecked() else 0}")
         else:
             self._disconnect()
 
@@ -663,7 +665,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pin_counts = ADC_FULL_SCALE - ppg_counts
         pin_mv = adc_counts_to_mv(pin_counts, gain_idx)
         self.adc_v_label.setText(
-            f"AIN0 pin: {pin_mv:.3f} mV  |  PPG: {ppg_counts:.0f} counts (inverted)")
+            f"AIN0 pin: {pin_mv:.3f} mV  |  PPG: {ppg_counts:.0f} counts")
 
         if self.current_ac_amp > 0:
             ac_mv = adc_counts_to_mv(self.current_ac_amp, gain_idx)
@@ -690,7 +692,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.record_file:
             self._stop_recording()
         if self.reader:
-            self._send("HVEN:0")
             self.reader.stop()
         event.accept()
 

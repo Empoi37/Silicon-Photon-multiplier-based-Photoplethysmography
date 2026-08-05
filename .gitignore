@@ -1,0 +1,16 @@
+# Downloaded open datasets (multi-GB) — fetched on demand by pc/ml/dalia.py
+data/datasets/*
+!data/datasets/.gitkeep
+
+# Bench recordings and sweep plots -- session artifacts, not code. The
+# trained model (data/models/hr_correction.json) is NOT ignored: the app
+# loads it by default, so it needs to ship in the repo.
+data/recordings/*
+!data/recordings/.gitkeep
+
+# Local dev
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.idea/

@@ -57,8 +57,19 @@ class SignalPanel(QtWidgets.QWidget):
         self.curve_ay = self.plot_acc.plot(pen=pg.mkPen("#f1c40f", width=1), name="Y")
         self.curve_az = self.plot_acc.plot(pen=pg.mkPen("#9b59b6", width=1), name="Z")
 
+        self.plot_bpm = pg.PlotWidget(title="Heart rate trend (BPM)")
+        self.plot_bpm.addLegend()
+        self.plot_bpm.setLabel("bottom", "Sample")
+        self.plot_bpm.setLabel("left", "BPM")
+        self.plot_bpm.showGrid(x=True, y=True, alpha=0.3)
+        self.curve_bpm_raw = self.plot_bpm.plot(
+            pen=pg.mkPen("#7f8c8d", width=2), name="Raw (no ML)")
+        self.curve_bpm_ml = self.plot_bpm.plot(
+            pen=pg.mkPen("#27ae60", width=2), name="ML corrected")
+
         graphs.addWidget(self.plot_raw, 2)
         graphs.addWidget(self.plot_proc, 2)
+        graphs.addWidget(self.plot_bpm, 2)
         graphs.addWidget(self.plot_acc, 1)
         return container
 
@@ -125,6 +136,13 @@ class SignalPanel(QtWidgets.QWidget):
                 self.scatter_beats.setData(x=x_f[local], y=filt_view[local])
                 return
         self.scatter_beats.setData([], [])
+
+    def update_bpm_trend(self, x: np.ndarray, raw: np.ndarray, ml: np.ndarray, show_ml: bool):
+        self.curve_bpm_raw.setData(x, raw)
+        if show_ml:
+            self.curve_bpm_ml.setData(x, ml)
+        else:
+            self.curve_bpm_ml.setData([], [])
 
     def update_bpm(self, bpm: float, valid: bool):
         if valid and bpm > 0:

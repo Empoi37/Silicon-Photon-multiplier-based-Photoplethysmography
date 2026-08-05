@@ -38,6 +38,7 @@ from app.panels.signal_panel import SignalPanel
 from app.utils import adc_counts_to_mv, ensure_qt_plugins_visible
 from app.workers.serial_worker import SerialReader
 from control.agc import ADC_FULL_SCALE, AutoTuner, BoostOptimizer
+from ml.hr_correction import HrCorrectionModel
 from pipeline.core import PpgHrProcessor, PpgMode
 
 ensure_qt_plugins_visible()
@@ -46,6 +47,10 @@ PLOT_SECONDS = 8
 NOMINAL_FS = 250
 BUFFER_LEN = PLOT_SECONDS * NOMINAL_FS
 RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "data" / "recordings"
+
+# BPM trend plot: compute() runs every 4th refresh tick (~200ms @ the 50ms
+# timer below), so 5 Hz -- 600 points covers a 2-minute window.
+BPM_HISTORY_LEN = 600
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -60,6 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mode=PpgMode.MULTILED,
             fft_window_s=8.0,
             max_buffer_s=14.0,
+            correction_model=HrCorrectionModel.load_default(),
         )
 
         self.t: deque[int] = deque(maxlen=BUFFER_LEN)
@@ -79,6 +85,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._latest_result = None
         self._plot_tick = 0
 
+        self.bpm_hist_x: deque[int] = deque(maxlen=BPM_HISTORY_LEN)
+        self.bpm_hist_raw: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
+        self.bpm_hist_ml: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
+
         self.record_file = None
         self.record_writer = None
         self.record_path = None
@@ -91,6 +101,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._wire_signals()
+
+        if self.hr_proc.correction_model is not None:
+            self._log("# HR correction model loaded (data/models/hr_correction.json)")
+            self.control_panel.set_ml_available(True)
+        else:
+            self._log("# No HR correction model found -- using raw FFT tracker "
+                      "(run pc/ml/train_hr_correction.py to train one)")
+            self.control_panel.set_ml_available(False)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._refresh_plots)
@@ -137,6 +155,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control_panel.motionToggled.connect(
             lambda c: setattr(self.hr_proc, "use_motion_cancel", c))
         self.control_panel.boostOptToggled.connect(self._on_boost_opt_toggled)
+        self.control_panel.mlToggled.connect(
+            lambda c: setattr(self.hr_proc, "use_ml_correction", c))
 
         self.recording_panel.startRequested.connect(self._start_recording)
         self.recording_panel.stopRequested.connect(self._stop_recording)
@@ -156,6 +176,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bpm_valid = False
         self._latest_result = None
         self._plot_tick = 0
+        self.bpm_hist_x.clear()
+        self.bpm_hist_raw.clear()
+        self.bpm_hist_ml.clear()
         while not self.data_queue.empty():
             try:
                 self.data_queue.get_nowait()
@@ -357,6 +380,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.beat_indices = result.beat_indices
 
             self.signal_panel.update_filtered_plot(x, result.filtered, self.beat_indices)
+
+            if result.bpm_valid:
+                self.bpm_hist_x.append(self.sample_index)
+                self.bpm_hist_raw.append(result.bpm_raw)
+                self.bpm_hist_ml.append(
+                    result.bpm_ml if result.bpm_ml is not None else np.nan)
+                self.signal_panel.update_bpm_trend(
+                    np.fromiter(self.bpm_hist_x, dtype=float),
+                    np.fromiter(self.bpm_hist_raw, dtype=float),
+                    np.fromiter(self.bpm_hist_ml, dtype=float),
+                    self.control_panel.is_ml_compare_enabled(),
+                )
 
         self.signal_panel.update_accel_plot(
             x,

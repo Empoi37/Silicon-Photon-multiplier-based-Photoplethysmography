@@ -18,12 +18,16 @@ class ControlPanel(QtWidgets.QGroupBox):
     motionToggled(bool)          Active/désactive l'annulation de mouvement
     centerDisplayToggled(bool)   Centre l'affichage brut (retire la DC visuellement)
     boostOptToggled(bool)        Active/désactive l'optimiseur de BOOST
+    mlToggled(bool)               Active/désactive la correction BPM par ML
+    mlCompareToggled(bool)        Affiche brut + ML superposés sur le graphique BPM
     """
 
     autoToggled = QtCore.Signal(bool)
     motionToggled = QtCore.Signal(bool)
     centerDisplayToggled = QtCore.Signal(bool)
     boostOptToggled = QtCore.Signal(bool)
+    mlToggled = QtCore.Signal(bool)
+    mlCompareToggled = QtCore.Signal(bool)
 
     def __init__(self):
         super().__init__("Automatic control")
@@ -52,6 +56,17 @@ class ControlPanel(QtWidgets.QGroupBox):
         self.boost_opt_btn.setChecked(False)
         self.boost_opt_btn.toggled.connect(self._on_boost_opt_toggle)
 
+        self.ml_btn = QtWidgets.QCheckBox("Use ML heart-rate correction")
+        self.ml_btn.setChecked(True)
+        self.ml_btn.setEnabled(False)
+        self.ml_btn.toggled.connect(self._on_ml_toggle)
+
+        self.ml_compare_btn = QtWidgets.QCheckBox(
+            "Show raw vs. ML comparison on graph")
+        self.ml_compare_btn.setChecked(False)
+        self.ml_compare_btn.setEnabled(False)
+        self.ml_compare_btn.toggled.connect(self.mlCompareToggled.emit)
+
         self.auto_status = QtWidgets.QLabel("Auto-tuning: off")
         self.auto_status.setWordWrap(True)
         self.auto_status.setStyleSheet("color:#777;font-size:11px;")
@@ -61,6 +76,7 @@ class ControlPanel(QtWidgets.QGroupBox):
 
         for w in (self.auto_btn, self.motion_btn, self.dc_servo_btn,
                   self.center_display_btn, self.boost_opt_btn,
+                  self.ml_btn, self.ml_compare_btn,
                   self.auto_status, self.boost_status):
             lay.addWidget(w)
 

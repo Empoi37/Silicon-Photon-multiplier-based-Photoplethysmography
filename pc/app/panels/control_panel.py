@@ -75,6 +75,29 @@ class ControlPanel(QtWidgets.QGroupBox):
             "BOOST optimizer: exploring..." if checked else "BOOST optimizer: off")
         self.boostOptToggled.emit(checked)
 
+    def _on_ml_toggle(self, checked: bool):
+        self.mlToggled.emit(checked)
+
+    def set_auto_enabled(self, checked: bool):
+        """Programmatic toggle — QPushButton.setChecked() doesn't emit clicked()."""
+        self.auto_btn.setChecked(checked)
+        self._on_auto_toggle(checked)
+
+    def set_boost_opt_enabled(self, checked: bool):
+        self.boost_opt_btn.setChecked(checked)
+
+    def set_ml_available(self, available: bool):
+        """Enable the ML controls only once a correction model is actually
+        loaded -- otherwise there's nothing for either checkbox to do."""
+        self.ml_btn.setEnabled(available)
+        self.ml_compare_btn.setEnabled(available)
+        if not available:
+            self.ml_btn.setChecked(False)
+            self.ml_compare_btn.setChecked(False)
+
+    def is_ml_compare_enabled(self) -> bool:
+        return self.ml_compare_btn.isChecked()
+
     def is_motion_cancel_enabled(self) -> bool:
         return self.motion_btn.isChecked()
 

@@ -165,10 +165,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reader = SerialReader(port, self.data_queue)
         self.reader.message.connect(self._log)
         self.reader.error.connect(self._on_error)
+        self.reader.ready.connect(self._on_reader_ready)
         self.reader.start()
         self.connection_panel.set_connected_ui(True)
         self._log(f"# Connected to {port}")
 
+    def _on_reader_ready(self):
+        # Opening the port often resets the ESP32 (DTR) and its setup()
+        # (I2C init for the digital pots / ADC / accelerometer) takes real
+        # time -- commands sent before this fired would be silently
+        # dropped (port not open yet) or ignored (firmware not ready).
+        # SerialReader only emits this once the link is actually live: the
+        # first real sample arrived, or a timeout elapsed as a fallback.
         hw = self.hardware_panel
         self._send(f"ADSGAIN:{hw.sl_adsgain.slider.value()}")
         self._send(f"GAIN:{hw.sl_gain.slider.value()}")
@@ -178,6 +186,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send(f"LED1:{hw.sl_led1.slider.value()}")
         self._send(f"LED2:{hw.sl_led2.slider.value()}")
         self._send(f"HVEN:{1 if hw.is_hv_enabled() else 0}")
+
+        # Seed AGC from the connect-time preset, then let it track ambient
+        # light / skin tone drift automatically instead of requiring a
+        # manual toggle each session. BOOST auto-optimize stays manual --
+        # it stalls whenever bpm_valid is false (no usable quality samples),
+        # which needs more bench validation before it runs unattended.
+        self.control_panel.set_auto_enabled(True)
 
     def _disconnect(self):
         if self.record_file:

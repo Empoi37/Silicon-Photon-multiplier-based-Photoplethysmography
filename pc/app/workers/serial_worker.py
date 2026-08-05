@@ -28,6 +28,14 @@ class SerialReader(QtCore.QThread):
     ───────
     message(str)   Émis pour chaque ligne de statut du firmware ("# ...")
     error(str)     Émis en cas d'erreur d'ouverture ou de lecture du port
+    ready()        Émis une fois -- dès le premier échantillon valide reçu,
+                    ou après READY_TIMEOUT_S si rien n'arrive. Ouvrir le
+                    port ne suffit pas : côté ESP32, l'ouverture déclenche
+                    souvent un reset (DTR), et setup() (init I2C des pots
+                    numériques, ADS1115, etc.) prend un temps non nul.
+                    Toute commande envoyée avant ce signal peut être
+                    perdue (le port n'est pas encore ouvert côté thread)
+                    ou ignorée (le firmware n'a pas fini setup()).
 
     Les échantillons valides sont poussés dans `data_queue` sous forme de
     tuple (led1, led2, ax, ay, az, timestamp_unix).
@@ -35,6 +43,9 @@ class SerialReader(QtCore.QThread):
 
     message = QtCore.Signal(str)
     error = QtCore.Signal(str)
+    ready = QtCore.Signal()
+
+    READY_TIMEOUT_S = 3.0
 
     def __init__(self, port: str, data_queue: "queue.Queue", baudrate: int = BAUDRATE):
         super().__init__()
@@ -52,12 +63,19 @@ class SerialReader(QtCore.QThread):
             return
 
         self._running = True
+        t_start = time.time()
+        ready_sent = False
         while self._running:
             try:
                 raw = self._ser.readline()
             except serial.SerialException as exc:
                 self.error.emit(f"Serial read error: {exc}")
                 break
+
+            if not ready_sent and (time.time() - t_start) >= self.READY_TIMEOUT_S:
+                ready_sent = True
+                self.ready.emit()
+
             if not raw:
                 continue
 
@@ -75,6 +93,9 @@ class SerialReader(QtCore.QThread):
                 led1, led2, ax, ay, az = (int(p) for p in parts)
             except ValueError:
                 continue
+            if not ready_sent:
+                ready_sent = True
+                self.ready.emit()
             self.data_queue.put((led1, led2, ax, ay, az, time.time()))
 
         if self._ser and self._ser.is_open:

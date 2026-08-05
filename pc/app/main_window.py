@@ -235,9 +235,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.reader is None:
             return
 
+        ibi_cv = self._latest_result.ibi_cv if self._latest_result else float("inf")
+        amp_cv = self._latest_result.peak_amp_cv if self._latest_result else float("inf")
+
         if self.boost_opt_enabled:
             new_boost, msg = self.boost_opt.step_quality(
-                self.current_inband_snr, self.bpm_valid, self.current_motion)
+                self.current_inband_snr, self.bpm_valid, self.current_motion,
+                ibi_cv=ibi_cv, amp_cv=amp_cv)
             if new_boost is not None:
                 self._send(f"BOOST:{new_boost}")
                 self.hardware_panel.sl_boost.set_silent(new_boost)
@@ -248,7 +252,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         raw = np.fromiter(self.buf_ppg, dtype=float)[-int(1.5 * NOMINAL_FS):]
-        cmds, reason = self.auto_tuner.step(raw)
+        cmds, reason = self.auto_tuner.step(
+            raw, valid=self.bpm_valid, ibi_cv=ibi_cv, amp_cv=amp_cv)
         hw = self.hardware_panel
         for cmd in cmds:
             self._send(cmd)

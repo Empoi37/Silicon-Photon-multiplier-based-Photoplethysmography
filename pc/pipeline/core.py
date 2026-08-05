@@ -9,6 +9,8 @@ from enum import Enum
 import numpy as np
 from scipy.signal import butter, detrend, find_peaks, sosfiltfilt
 
+from ml.hr_correction import HrCorrectionModel
+
 
 class PpgMode(str, Enum):
     MULTILED = "multiled"
@@ -31,6 +33,10 @@ class PpgHrResult:
     bpm_method: str = "fft"
     motion_level: float = 0.0
     inband_snr: float = 0.0
+    ibi_cv: float = float("inf")
+    peak_amp_cv: float = float("inf")
+    bpm_raw: float = 0.0
+    bpm_ml: float | None = None
 
 
 def robust_ac_amplitude(x: np.ndarray, fs: float) -> float:
@@ -104,8 +110,16 @@ def inband_snr(x: np.ndarray, fs: float, lo: float = 0.7, hi: float = 3.5,
 
 
 def cancel_motion(ppg: np.ndarray, accel: np.ndarray, fs: float,
-                  n_lags: int = 6) -> tuple[np.ndarray, float]:
-    """Subtract accelerometer-correlated component via Wiener regression."""
+                  n_lags: int = 80) -> tuple[np.ndarray, float]:
+    """Subtract accelerometer-correlated component via Wiener regression.
+
+    n_lags=80 (~320ms @ 250Hz) was chosen by sweeping against PPG-DaLiA
+    ground truth (pc/ml/dalia.py) -- MAE improves monotonically from 6 lags
+    (11.28 BPM) down to a minimum at 80 (9.90 BPM), then gets worse past
+    that (100 -> 10.01, 130 -> 10.58) as the regression starts overfitting
+    noise instead of removing motion. See pc/ml/train_hr_correction.py for
+    the same replay infrastructure this sweep reused.
+    """
     n = len(ppg)
     if n < int(2.0 * fs) or accel.shape[0] != n:
         return ppg, 0.0
@@ -148,9 +162,41 @@ class PpgHrProcessor:
     fft_window_s: float = 8.0
     bpm_smooth: float = 0.75
     min_fft_quality: float = 1.2
+    # Higher bar than min_fft_quality specifically for the *first* lock (or
+    # re-lock after losing one) -- a weak initial lock gets defended by the
+    # continuity penalty even when wrong, causing a slow multi-second drift
+    # toward the true value instead of just waiting for a confident one.
+    # Swept against PPG-DaLiA ground truth alongside time-to-first-lock
+    # (pc/ml/train_hr_correction.py infra): early-window MAE 27.4 -> 10.1
+    # BPM at 8.0, for a worst-case lock delay of 26s (vs 5s at 1.2). Higher
+    # values (14, 20) improve accuracy further but the delay explodes --
+    # 20.0 hit a 701s worst case in the sweep, unacceptable for a wearable.
+    lock_fft_quality: float = 8.0
     continuity_bpm: float = 20.0
     max_buffer_s: float = 14.0
     use_motion_cancel: bool = True
+    motion_n_lags: int = 80
+    # Confidence-weighted EMA blending, validated against PPG-DaLiA ground
+    # truth: MAE 9.90 -> 9.15 BPM, high-motion-window MAE 13.27 -> 12.43
+    # (pc/ml/train_hr_correction.py sweep infra). A barely-valid estimate
+    # should barely move the tracked BPM; fixed-weight smoothing let
+    # low-confidence motion-corrupted readings drag it around just as much
+    # as a confident one.
+    adaptive_smoothing: bool = True
+    quality_ref: float = 8.0
+    # Require detected peaks to actually be periodic/consistent (not just a
+    # confident-looking FFT peak) before trusting a window enough to update
+    # the tracked BPM -- same lesson as BoostOptimizer's SNR-can-be-fooled
+    # fix, applied to the tracker itself. Catches e.g. a motion/contact-loss
+    # wobble that has strong in-band spectral power but isn't a real pulse.
+    # Validated against PPG-DaLiA ground truth (pc/ml/train_hr_correction.py
+    # sweep infra): MAE 9.146 -> 9.138, median 5.239 -> 5.106, early-window
+    # (cold-start) MAE 27.4 -> 22.5 -- no regression on any metric.
+    regularity_gate: bool = True
+    max_ibi_cv: float = 0.35
+    max_amp_cv: float = 1.0
+    correction_model: HrCorrectionModel | None = None
+    use_ml_correction: bool = True
 
     _led1: list = field(default_factory=list)
     _led2: list = field(default_factory=list)
@@ -274,15 +320,31 @@ class PpgHrProcessor:
         if motion_norm > 1.5:
             quality *= 1.5 / motion_norm
 
-        valid = quality >= self.min_fft_quality
-        if valid:
-            if self._bpm_initialized:
+        required_quality = self.min_fft_quality if self._bpm_initialized else self.lock_fft_quality
+        spectrally_valid = quality >= required_quality
+        return bpm, spectrally_valid, quality
+
+    def _commit_bpm(self, bpm: float, quality: float) -> float:
+        """Blend a validated candidate into the tracked EMA. Only called for
+        windows that passed every gate (spectral quality, and -- when
+        regularity_gate is on -- peak regularity); a rejected window must
+        never reach here, or a fake-but-confident reading could still
+        corrupt the tracked value."""
+        if self._bpm_initialized:
+            if self.adaptive_smoothing:
+                # A barely-valid (low-quality) estimate should barely move
+                # the tracked value; let confident estimates move it more.
+                # Fixed smoothing blends both the same way, which lets
+                # low-confidence motion-corrupted readings drag the EMA
+                # around while still reporting "valid".
+                confidence = float(np.clip(quality / self.quality_ref, 0.0, 1.0))
+                alpha = confidence * (1.0 - self.bpm_smooth)
+                bpm = (1.0 - alpha) * self._bpm_ema + alpha * bpm
+            else:
                 bpm = self.bpm_smooth * self._bpm_ema + (1.0 - self.bpm_smooth) * bpm
-            self._bpm_ema = bpm
-            self._bpm_initialized = True
-        else:
-            bpm = self._bpm_ema if self._bpm_initialized else 0.0
-        return bpm, valid, quality
+        self._bpm_ema = bpm
+        self._bpm_initialized = True
+        return bpm
 
     def _find_beats(self, x: np.ndarray, bpm: float) -> np.ndarray:
         if len(x) < int(1.5 * self.fs) or bpm <= 0:
@@ -291,6 +353,20 @@ class PpgHrProcessor:
         prominence = max(_robust_pp(x) * 0.15, 0.03)
         peaks, _ = find_peaks(x, distance=min_dist, prominence=prominence)
         return peaks
+
+    def _beat_regularity(self, peaks: np.ndarray, x: np.ndarray) -> tuple[float, float]:
+        """Coefficient of variation of inter-beat intervals and peak
+        amplitudes. A real, cleanly-coupled pulse is periodic and
+        consistent; a strong-but-fake in-band SNR (e.g. a distorted or
+        motion-driven signal) usually isn't -- this is what lets callers
+        (BoostOptimizer) tell the two apart instead of trusting SNR alone."""
+        if len(peaks) < 4:
+            return float("inf"), float("inf")
+        ibi = np.diff(peaks) / self.fs
+        ibi_cv = float(np.std(ibi) / np.mean(ibi)) if np.mean(ibi) > 0 else float("inf")
+        heights = x[peaks]
+        amp_cv = float(np.std(heights) / abs(np.mean(heights))) if np.mean(heights) != 0 else float("inf")
+        return ibi_cv, amp_cv
 
     def compute(self) -> PpgHrResult | None:
         resampled = self._resample_uniform()
@@ -311,24 +387,63 @@ class PpgHrProcessor:
         channels = []
         for c in channels_raw:
             if self.use_motion_cancel:
-                cc, ml = cancel_motion(c, accel, self.fs)
+                cc, ml = cancel_motion(c, accel, self.fs, n_lags=self.motion_n_lags)
                 motion_level = max(motion_level, ml)
                 channels.append(cc)
             else:
                 channels.append(c)
 
         motion_norm = motion_level / 512.0
-        bpm, valid, quality = self._track_bpm(channels, accel_mag, motion_norm)
+        cand_bpm, spectrally_valid, quality = self._track_bpm(channels, accel_mag, motion_norm)
 
         snr_list = [inband_snr(c, self.fs) for c in channels]
         best = int(np.argmax(snr_list)) if snr_list else 0
         best_ch = channels[best]
         inband = float(snr_list[best]) if snr_list else 0.0
-        peaks = self._find_beats(best_ch, bpm if valid else self._bpm_ema)
+
+        probe_bpm = cand_bpm if spectrally_valid else (self._bpm_ema if self._bpm_initialized else 0.0)
+        peaks = self._find_beats(best_ch, probe_bpm)
+        ibi_cv, peak_amp_cv = self._beat_regularity(peaks, best_ch)
+
+        if self.regularity_gate:
+            regular = len(peaks) >= 4 and ibi_cv <= self.max_ibi_cv and peak_amp_cv <= self.max_amp_cv
+            valid = spectrally_valid and regular
+        else:
+            valid = spectrally_valid
+
+        bpm_raw = self._commit_bpm(cand_bpm, quality) if valid else (
+            self._bpm_ema if self._bpm_initialized else 0.0)
 
         ac_amp = _robust_pp(best_ch)
         display = best_ch / (ac_amp / 2.0) if ac_amp > 1e-9 else best_ch.copy()
         combined = 0.5 * sum(channels) if len(channels) > 1 else channels[0]
+
+        method = "fft+accel" if self.use_motion_cancel else "fft"
+        bpm_ml = None
+        if self.correction_model is not None and valid:
+            corrected = self.correction_model.predict({
+                "fft_bpm": bpm_raw,
+                "quality": quality,
+                "inband_snr": inband,
+                "motion_level": motion_norm,
+                "ac_amplitude": ac_amp,
+            })
+            # A feature landing outside the training distribution (e.g. an
+            # accelerometer/gain scale the model never saw) can otherwise
+            # send a linear model's output arbitrarily far off -- never let
+            # the correction override the FFT estimate by more than a
+            # plausible nudge, or leave the physiological BPM range.
+            if abs(corrected - bpm_raw) <= 25.0 and self.bpm_min <= corrected <= self.bpm_max:
+                bpm_ml = corrected
+
+        # bpm_ml is always computed (when available) so the UI can plot raw
+        # vs. ML side by side even when the correction isn't the one driving
+        # the tracker/display -- use_ml_correction only picks which feeds `bpm`.
+        if bpm_ml is not None and self.use_ml_correction:
+            bpm = bpm_ml
+            method += "+ml"
+        else:
+            bpm = bpm_raw
 
         return PpgHrResult(
             raw_signal=combined,
@@ -342,7 +457,11 @@ class PpgHrProcessor:
             fs_effective=self.fs,
             snr=quality,
             ac_amplitude=ac_amp,
-            bpm_method="fft+accel" if self.use_motion_cancel else "fft",
+            bpm_method=method,
             motion_level=motion_norm,
             inband_snr=inband,
+            bpm_raw=bpm_raw,
+            bpm_ml=bpm_ml,
+            ibi_cv=ibi_cv,
+            peak_amp_cv=peak_amp_cv,
         )

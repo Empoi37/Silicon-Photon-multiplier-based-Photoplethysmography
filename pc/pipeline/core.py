@@ -67,7 +67,7 @@ def _detrend_channel(x: np.ndarray, fs: float) -> np.ndarray:
 
 def _despike(x: np.ndarray, sigma_limit: float = 5.0) -> np.ndarray:
     if len(x) < 8:
-        return x.copy()
+        return (x.copy())
     y = x.astype(float).copy()
     med = float(np.median(y))
     mad = float(np.median(np.abs(y - med)))
@@ -109,24 +109,9 @@ def inband_snr(x: np.ndarray, fs: float, lo: float = 0.7, hi: float = 3.5,
     return float(card / noise)
 
 
-def cancel_motion(ppg: np.ndarray, accel: np.ndarray, fs: float,
-                  n_lags: int = 80) -> tuple[np.ndarray, float]:
-    """Subtract accelerometer-correlated component via Wiener regression.
-
-    n_lags=80 (~320ms @ 250Hz) was chosen by sweeping against PPG-DaLiA
-    ground truth (pc/ml/dalia.py) -- MAE improves monotonically from 6 lags
-    (11.28 BPM) down to a minimum at 80 (9.90 BPM), then gets worse past
-    that (100 -> 10.01, 130 -> 10.58) as the regression starts overfitting
-    noise instead of removing motion. See pc/ml/train_hr_correction.py for
-    the same replay infrastructure this sweep reused.
-    """
-    n = len(ppg)
-    if n < int(2.0 * fs) or accel.shape[0] != n:
-        return ppg, 0.0
-
-    acc_bp = np.column_stack([_bandpass(accel[:, i], fs, 0.7, 4.0) for i in range(accel.shape[1])])
-    motion_level = float(np.mean([_robust_pp(acc_bp[:, i]) for i in range(acc_bp.shape[1])]))
-
+def _lagged_design_matrix(acc_bp: np.ndarray, n_lags: int) -> np.ndarray:
+    """Intercept column + `n_lags` samples of history per accelerometer axis."""
+    n = acc_bp.shape[0]
     cols = [np.ones(n)]
     for i in range(acc_bp.shape[1]):
         a = acc_bp[:, i]
@@ -137,19 +122,72 @@ def cancel_motion(ppg: np.ndarray, accel: np.ndarray, fs: float,
                 shifted = np.zeros(n)
                 shifted[lag:] = a[:-lag]
                 cols.append(shifted)
-    A = np.column_stack(cols)
+    return np.column_stack(cols)
+
+
+def cancel_motion(ppg: np.ndarray, acc_bp: np.ndarray, fs: float, n_lags: int = 120,
+                  ridge_alpha: float = 0.0, gate: str = "var") -> tuple[np.ndarray, float]:
+    """Subtract accelerometer-correlated component via per-window regression.
+
+    n_lags and ridge_alpha were both swept against PPG-DaLiA ground truth
+    (pc/ml/sweep_motion_cancel.py), measuring MAE on high-motion windows
+    specifically (not just the dataset-wide blend, which hides exactly the
+    windows this exists to fix): n_lags=80->120 improved high-motion MAE
+    10.62->9.97, n_lags=160 barely helped further (9.81) at a real cost to
+    calm-window accuracy (overall MAE 7.19->8.46), and n_lags>=200 collapses
+    outright (MAE >12 and climbing fast) as the unregularized fit overfits
+    the `3 axes * n_lags` autocorrelated lag columns. Ridge regularization
+    was tried as a fix for that overfitting -- it didn't help at any n_lags
+    or alpha tested; alpha=0 won every comparison. n_lags=120 is the
+    practical ceiling for this approach on real data; getting closer to a
+    wearable's true worst-case-while-moving target needs a different
+    technique, not just pushing this knob further.
+
+    A from-scratch persistent adaptive filter (NLMS) was also tried, on the
+    theory that carrying weights across windows would help -- it didn't:
+    both an NLMS variant and a fully causal per-sample version consistently
+    *underperformed* no cancellation at all. Root cause in hindsight: accel-
+    to-PPG motion coupling isn't stationary across a session (walking vs.
+    sitting couple differently), so a filter that blends old coupling
+    coefficients with new ones fights against what each window actually
+    needs -- a fresh best fit to its own motion characteristics. The batch
+    approach's "weakness" (no memory, refit every window) was actually the
+    right behavior.
+
+    `gate` picks the accept/reject check for a window's cleaned output:
+    "var" (revert if cleaned variance grew >5%) beat "snr" (revert if
+    in-band SNR didn't improve) empirically -- the SNR gate was too
+    conservative and rejected most genuinely-helpful cleanings.
+    """
+    n = len(ppg)
+    if n < int(2.0 * fs) or acc_bp.shape[0] != n:
+        return ppg, 0.0
+
+    motion_level = float(np.mean([_robust_pp(acc_bp[:, i]) for i in range(acc_bp.shape[1])]))
+
+    A = _lagged_design_matrix(acc_bp, n_lags)
     scales = np.std(A, axis=0)
     scales[scales < 1e-9] = 1.0
     A_norm = A / scales
 
+    d = A_norm.shape[1]
     try:
-        w, *_ = np.linalg.lstsq(A_norm, ppg, rcond=None)
+        if ridge_alpha > 0:
+            A_fit = np.vstack([A_norm, np.sqrt(ridge_alpha) * np.eye(d)])
+            b_fit = np.concatenate([ppg, np.zeros(d)])
+        else:
+            A_fit, b_fit = A_norm, ppg
+        w, *_ = np.linalg.lstsq(A_fit, b_fit, rcond=None)
         cleaned = ppg - A_norm @ w
     except np.linalg.LinAlgError:
-        cleaned = ppg
+        return ppg, motion_level
 
-    if np.std(cleaned) >= np.std(ppg) * 1.05:
-        cleaned = ppg
+    if not np.all(np.isfinite(cleaned)):
+        return ppg, motion_level
+    if gate == "snr" and inband_snr(cleaned, fs) < inband_snr(ppg, fs):
+        return ppg, motion_level
+    if gate == "var" and np.std(cleaned) >= np.std(ppg) * 1.05:
+        return ppg, motion_level
     return cleaned, motion_level
 
 
@@ -175,7 +213,9 @@ class PpgHrProcessor:
     continuity_bpm: float = 20.0
     max_buffer_s: float = 14.0
     use_motion_cancel: bool = True
-    motion_n_lags: int = 80
+    motion_n_lags: int = 120
+    motion_ridge_alpha: float = 0.0
+    motion_gate: str = "var"
     # Confidence-weighted EMA blending, validated against PPG-DaLiA ground
     # truth: MAE 9.90 -> 9.15 BPM, high-motion-window MAE 13.27 -> 12.43
     # (pc/ml/train_hr_correction.py sweep infra). A barely-valid estimate
@@ -184,6 +224,19 @@ class PpgHrProcessor:
     # as a confident one.
     adaptive_smoothing: bool = True
     quality_ref: float = 8.0
+    # Tried sharpening this (confidence**power + a relative-to-recent-
+    # baseline penalty) to fight a periodic ~10s signal-quality dip
+    # (respiratory/vasomotor modulation of PPG amplitude, confirmed via
+    # periodogram against a real recording's raw ADC trace) that was
+    # compounding into a 24 BPM reported swing. It worked for that resting
+    # scenario, but swept against PPG-DaLiA ground truth (activities with
+    # real HR transitions, not just resting) it made overall MAE strictly
+    # worse the harder it damped (10.59 -> 12.45 BPM from power 1 -> 6) --
+    # extra damping in the core tracker trades real responsiveness for
+    # resting-state smoothness everywhere, not just during a dip. Handling
+    # this in the UI instead (MainWindow's watch-style trailing-average BPM
+    # curve, separate from the instant reading) gets the smoothing without
+    # that tradeoff.
     # Require detected peaks to actually be periodic/consistent (not just a
     # confident-looking FFT peak) before trusting a window enough to update
     # the tracked BPM -- same lesson as BoostOptimizer's SNR-can-be-fooled
@@ -385,13 +438,16 @@ class PpgHrProcessor:
 
         motion_level = 0.0
         channels = []
-        for c in channels_raw:
-            if self.use_motion_cancel:
-                cc, ml = cancel_motion(c, accel, self.fs, n_lags=self.motion_n_lags)
+        if self.use_motion_cancel:
+            acc_bp = np.column_stack(
+                [_bandpass(accel[:, i], self.fs, 0.7, 4.0) for i in range(accel.shape[1])])
+            for c in channels_raw:
+                cc, ml = cancel_motion(c, acc_bp, self.fs, n_lags=self.motion_n_lags,
+                                       ridge_alpha=self.motion_ridge_alpha, gate=self.motion_gate)
                 motion_level = max(motion_level, ml)
                 channels.append(cc)
-            else:
-                channels.append(c)
+        else:
+            channels = channels_raw
 
         motion_norm = motion_level / 512.0
         cand_bpm, spectrally_valid, quality = self._track_bpm(channels, accel_mag, motion_norm)

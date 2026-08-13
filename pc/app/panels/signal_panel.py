@@ -66,6 +66,9 @@ class SignalPanel(QtWidgets.QWidget):
             pen=pg.mkPen("#7f8c8d", width=2), name="Raw (no ML)")
         self.curve_bpm_ml = self.plot_bpm.plot(
             pen=pg.mkPen("#27ae60", width=2), name="ML corrected")
+        self.curve_bpm_smooth = self.plot_bpm.plot(
+            pen=pg.mkPen("#2980b9", width=2, style=QtCore.Qt.DashLine),
+            name="Smoothed (~5s, watch-style)")
 
         graphs.addWidget(self.plot_raw, 2)
         graphs.addWidget(self.plot_proc, 2)
@@ -137,8 +140,11 @@ class SignalPanel(QtWidgets.QWidget):
                 return
         self.scatter_beats.setData([], [])
 
-    def update_bpm_trend(self, x: np.ndarray, raw: np.ndarray, ml: np.ndarray, show_ml: bool):
+    def update_bpm_trend(self, x: np.ndarray, raw: np.ndarray, ml: np.ndarray, show_ml: bool,
+                         smooth: np.ndarray | None = None):
         self.curve_bpm_raw.setData(x, raw)
+        if smooth is not None:
+            self.curve_bpm_smooth.setData(x, smooth)
         if show_ml:
             self.curve_bpm_ml.setData(x, ml)
         else:

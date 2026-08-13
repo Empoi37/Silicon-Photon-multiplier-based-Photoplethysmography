@@ -129,11 +129,13 @@ def load_subject(subject_id: int, dataset_dir: Path = DATASET_DIR) -> SubjectDat
     return SubjectData(subject_id, bvp, accel, label, label_t)
 
 
-def replay_subject(subject: SubjectData, motion_n_lags: int = 80,
-                   adaptive_smoothing: bool = True, lock_fft_quality: float = 8.0,
-                   regularity_gate: bool = True):
+def replay_subject(subject: SubjectData, **processor_kwargs):
     """Push one subject's BVP+accel through a fresh PpgHrProcessor sample by
     sample, calling compute() at each ground-truth label timestamp.
+
+    `processor_kwargs` is forwarded straight to PpgHrProcessor(...), so any
+    tunable field there (motion_n_lags, motion_ridge_alpha, adaptive_smoothing,
+    ...) can be swept without editing this function.
 
     Yields (features: dict, true_hr: float). Feature keys mirror
     PpgHrResult fields exactly, so pc/ml/hr_correction.py can apply the
@@ -141,10 +143,7 @@ def replay_subject(subject: SubjectData, motion_n_lags: int = 80,
     """
     proc = PpgHrProcessor(frame_fs=BVP_FS, mode=PpgMode.ADC_ONLY,
                           fft_window_s=8.0, max_buffer_s=14.0,
-                          motion_n_lags=motion_n_lags,
-                          adaptive_smoothing=adaptive_smoothing,
-                          lock_fft_quality=lock_fft_quality,
-                          regularity_gate=regularity_gate)
+                          **processor_kwargs)
     t = np.arange(len(subject.bvp)) / BVP_FS
 
     label_idx = 0
@@ -170,12 +169,11 @@ def replay_subject(subject: SubjectData, motion_n_lags: int = 80,
 
 
 def iter_subjects(dataset_dir: Path = DATASET_DIR, ids: list[int] | None = None,
-                  motion_n_lags: int = 80, adaptive_smoothing: bool = True,
-                  lock_fft_quality: float = 8.0, regularity_gate: bool = True):
-    """Yields (subject_id, [(features, true_hr), ...]) for each subject."""
+                  **processor_kwargs):
+    """Yields (subject_id, [(features, true_hr), ...]) for each subject.
+
+    `processor_kwargs` is forwarded to replay_subject() -> PpgHrProcessor(...).
+    """
     for sid in (ids if ids is not None else subject_ids(dataset_dir)):
         subject = load_subject(sid, dataset_dir)
-        yield sid, list(replay_subject(subject, motion_n_lags=motion_n_lags,
-                                       regularity_gate=regularity_gate,
-                                       adaptive_smoothing=adaptive_smoothing,
-                                       lock_fft_quality=lock_fft_quality))
+        yield sid, list(replay_subject(subject, **processor_kwargs))

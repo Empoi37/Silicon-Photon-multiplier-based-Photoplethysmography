@@ -52,6 +52,26 @@ RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "data" / "recordings"
 # timer below), so 5 Hz -- 600 points covers a 2-minute window.
 BPM_HISTORY_LEN = 600
 
+# Trailing-average window for the "watch-style" smoothed BPM curve, roughly
+# matching how Apple Watch / Garmin's optical HR display refreshes (a short
+# multi-second average, not a raw beat-to-beat number) -- separate from and
+# on top of the tracker's own EMA damping, since a plain windowed mean over
+# the already-computed instant readings is the simplest way to show what a
+# consumer watch's reading would look like next to ours for comparison.
+#
+# 5.0 was too short to damp respiratory/vasomotor modulation of the PPG
+# amplitude (see pipeline/core.py's adaptive_smoothing comment) -- a resting
+# recording (2026-08-11) periodogrammed to a dominant ~9.3s oscillation
+# (0.108 Hz, ~6.5 breaths/min) riding the true BPM, and a box average only
+# nulls frequencies at multiples of 1/window, so 5s (0.2 Hz) barely touched
+# it (~40% attenuation). 15s covers ~1.5-2 respiratory cycles at that rate
+# and attenuates the whole typical RSA band (0.1-0.4 Hz, i.e. 6-24
+# breaths/min) much harder, at the cost of more display lag on real BPM
+# transitions -- acceptable here since this curve is explicitly the smooth
+# comparison line, not the responsive one (that's bpm_hist_instant/raw/ml).
+WATCH_AVG_SECONDS = 15.0
+WATCH_AVG_SAMPLES = int(WATCH_AVG_SECONDS * NOMINAL_FS)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -88,6 +108,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bpm_hist_x: deque[int] = deque(maxlen=BPM_HISTORY_LEN)
         self.bpm_hist_raw: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
         self.bpm_hist_ml: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
+        self.bpm_hist_instant: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
+        self.bpm_hist_smooth: deque[float] = deque(maxlen=BPM_HISTORY_LEN)
 
         self.record_file = None
         self.record_writer = None
@@ -179,6 +201,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bpm_hist_x.clear()
         self.bpm_hist_raw.clear()
         self.bpm_hist_ml.clear()
+        self.bpm_hist_instant.clear()
+        self.bpm_hist_smooth.clear()
         while not self.data_queue.empty():
             try:
                 self.data_queue.get_nowait()
@@ -386,11 +410,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bpm_hist_raw.append(result.bpm_raw)
                 self.bpm_hist_ml.append(
                     result.bpm_ml if result.bpm_ml is not None else np.nan)
+                self.bpm_hist_instant.append(result.bpm)
+
+                # Watch-style smoothed line: trailing mean of the instant
+                # BPM (result.bpm -- raw or ML-corrected, whichever is
+                # actually driving the display right now) over the last
+                # WATCH_AVG_SECONDS, using the sample-index x-values already
+                # kept in bpm_hist_x so gaps from invalid stretches don't
+                # skew the window.
+                x_hist = np.fromiter(self.bpm_hist_x, dtype=float)
+                instant_hist = np.fromiter(self.bpm_hist_instant, dtype=float)
+                window = x_hist >= (self.sample_index - WATCH_AVG_SAMPLES)
+                self.bpm_hist_smooth.append(float(np.mean(instant_hist[window])))
+
                 self.signal_panel.update_bpm_trend(
-                    np.fromiter(self.bpm_hist_x, dtype=float),
+                    x_hist,
                     np.fromiter(self.bpm_hist_raw, dtype=float),
                     np.fromiter(self.bpm_hist_ml, dtype=float),
                     self.control_panel.is_ml_compare_enabled(),
+                    np.fromiter(self.bpm_hist_smooth, dtype=float),
                 )
 
         self.signal_panel.update_accel_plot(

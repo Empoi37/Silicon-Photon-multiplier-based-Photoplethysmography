@@ -54,10 +54,12 @@ class AutoTuner:
     # backfiring and just keeps pushing to the ceiling.
     _pending_state: tuple | None = field(default=None, repr=False)
     _pending_ac: float = field(default=-1.0, repr=False)
+    _pending_snr: float = field(default=-1.0, repr=False)
     # "low_ac" (verified against _pending_ac) or "relax" (verified against
     # AC_TARGET_MIN/near_sat directly) -- the two paths that leave a pending
     # change need different success criteria, see step().
     _pending_kind: str = field(default="", repr=False)
+    _verify_samples: list = field(default_factory=list, repr=False)
     _low_ac_backoff: int = field(default=0, repr=False)
     # A step whose true effect is smaller than tick-to-tick AC noise (from
     # breathing, motion, contact pressure) would otherwise revert forever in
@@ -75,12 +77,27 @@ class AutoTuner:
     # source of the oscillation (the step often *did* help; the noise on
     # the very next window just briefly masked it).
     ac_improve_margin: float = 0.05
+    # A bigger AC swing (p99-p1) that comes with meaningfully *worse*
+    # in-band SNR is the same SiPM-saturation trap documented above under
+    # led_step (more light -> more raw amplitude without the pulse actually
+    # getting cleaner) -- allow some slack since SNR is noisier window to
+    # window than AC, but don't let a step through if it tanked SNR by more
+    # than this fraction.
+    snr_regress_margin: float = 0.10
     # tools/sweep_preset.py's own settling analysis warns TIA RC settling
     # time grows with gain, and even its 1.0s default --settle isn't always
-    # enough at high gain -- judging "did this help" after only the normal
-    # 3-tick (1.5s) cooldown risks measuring mid-transient. Give a gain
-    # change more room (8 ticks = 4s) before trusting the AC comparison.
-    verify_ticks: int = 8
+    # enough at high gain -- judging "did this help" right after the normal
+    # 3-tick (1.5s) cooldown risks measuring mid-transient. settle_ticks lets
+    # the hardware physically settle first; measure_ticks then collects that
+    # many samples and compares their *median* against the pre-change
+    # baseline instead of trusting a single before/after snapshot -- a
+    # single window is noisy (breathing, contact micro-shifts), and now that
+    # "keep" requires AC *and* SNR *and* regularity to all agree, a single
+    # bad sample on any one of them would revert a change that was actually
+    # fine. Same measure-then-median approach as BoostOptimizer below.
+    # Total wait (8 ticks = 4s) matches the old single-sample verify_ticks.
+    settle_ticks: int = 3
+    measure_ticks: int = 5
     # Gate the "low AC -> raise gain" optimization on the tracker NOT
     # already having a clean lock -- a bench recording with the sensor
     # pressed hard showed AC drop well under AC_TARGET_MIN (occlusion
@@ -119,7 +136,9 @@ class AutoTuner:
         self._baseline_gain_tia = self.gain_tia
         self._pending_state = None
         self._pending_ac = -1.0
+        self._pending_snr = -1.0
         self._pending_kind = ""
+        self._verify_samples = []
         self._low_ac_backoff = 0
         self._low_ac_fail_streak = 0
         self._relax_backoff = self.relax_backoff_ticks
@@ -129,8 +148,19 @@ class AutoTuner:
         self.gain_tia = int(np.clip(self.gain_tia, self.gain_min, self.gain_max))
         self.ads_gain = int(np.clip(self.ads_gain, self.ads_min, self.ads_max))
 
+    def _regularity_ok(self, ibi_cv: float, amp_cv: float) -> bool:
+        """True if peak regularity is within bounds, or not measurable yet
+        (ibi_cv/amp_cv come back as inf when there aren't enough detected
+        peaks -- e.g. right after a change, before the tracker has settled).
+        Inconclusive shouldn't block a verification that otherwise looks
+        fine; only a *confirmed* irregular signal should."""
+        if not np.isfinite(ibi_cv) or not np.isfinite(amp_cv):
+            return True
+        return ibi_cv <= self.max_ibi_cv and amp_cv <= self.max_amp_cv
+
     def step(self, raw_window: np.ndarray, valid: bool = True,
-             ibi_cv: float = 0.0, amp_cv: float = 0.0) -> tuple[list[str], str]:
+             ibi_cv: float = 0.0, amp_cv: float = 0.0,
+             inband_snr: float = 0.0) -> tuple[list[str], str]:
         cmds: list[str] = []
         if raw_window is None or len(raw_window) < 16:
             return cmds, ""
@@ -150,17 +180,38 @@ class AutoTuner:
         # success criteria: a low-AC raise must show a real AC gain over
         # what it was before, while a relax step just needs to confirm it
         # didn't quietly break anything (AC still usable, no new clipping).
+        # Both also now require SNR/regularity to not have gotten worse --
+        # AC amplitude alone can't tell a genuinely cleaner pulse from a
+        # louder-but-noisier one (a visually "thin", clean trace is what
+        # SNR + low ibi_cv/amp_cv actually measure; raw p99-p1 doesn't).
+        #
+        # Collect measure_ticks samples and compare their *median* rather
+        # than a single before/after snapshot -- with three metrics now
+        # required to agree, a single noisy tick on any one of them would
+        # revert a change that was actually fine.
         if self._pending_state is not None:
+            self._verify_samples.append((ac, inband_snr, ibi_cv, amp_cv, near_sat))
+            if len(self._verify_samples) < self.measure_ticks:
+                return cmds, ""
+            med_ac, med_snr, med_ibi, med_amp, med_near_sat = np.median(
+                np.array(self._verify_samples, dtype=float), axis=0)
+            self._verify_samples = []
+
             if self._pending_kind == "relax":
-                ok = ac >= AC_TARGET_MIN and near_sat <= 0.02
+                ok = (med_ac >= AC_TARGET_MIN and med_near_sat <= 0.02
+                     and self._regularity_ok(med_ibi, med_amp))
             else:
-                ok = ac > self._pending_ac * (1.0 + self.ac_improve_margin)
+                ac_ok = med_ac > self._pending_ac * (1.0 + self.ac_improve_margin)
+                snr_ok = (self._pending_snr <= 0
+                         or med_snr >= self._pending_snr * (1.0 - self.snr_regress_margin))
+                ok = ac_ok and snr_ok and self._regularity_ok(med_ibi, med_amp)
 
             if not ok:
                 kind = self._pending_kind
                 self.led, self.gain_tia, self.ads_gain = self._pending_state
                 self._pending_state = None
                 self._pending_ac = -1.0
+                self._pending_snr = -1.0
                 self._pending_kind = ""
                 self._cooldown = 3
                 if kind == "relax":
@@ -176,7 +227,7 @@ class AutoTuner:
                 return ([f"LED1:{self.led}", f"LED2:{self.led}", f"GAIN:{self.gain_tia}"], msg)
 
             # A relax step that verified fine keeps climbing/lowering right
-            # away (just the normal verify_ticks cooldown below, same pace
+            # away (just the normal settle+measure wait below, same pace
             # as low-AC) -- only a step that turned out unsafe should wait
             # the long converged_backoff before trying again. Otherwise
             # restoring LED/gain across several steps back to baseline
@@ -185,6 +236,7 @@ class AutoTuner:
                 self._low_ac_fail_streak = 0
             self._pending_state = None
             self._pending_ac = -1.0
+            self._pending_snr = -1.0
             self._pending_kind = ""
 
         if self._low_ac_backoff > 0:
@@ -236,6 +288,7 @@ class AutoTuner:
             if reason:
                 self._pending_state = before
                 self._pending_ac = ac
+                self._pending_snr = inband_snr
                 self._pending_kind = "low_ac"
 
         elif (self._relax_backoff == 0 and near_sat <= 0.02 and near_floor <= 0.02
@@ -269,7 +322,7 @@ class AutoTuner:
         if after[2] != before[2]:
             cmds.append(f"ADSGAIN:{self.ads_gain}")
 
-        self._cooldown = self.verify_ticks if self._pending_state is not None else 3
+        self._cooldown = self.settle_ticks if self._pending_state is not None else 3
         return cmds, reason
 
 

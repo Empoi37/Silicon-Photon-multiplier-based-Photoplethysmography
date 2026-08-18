@@ -68,7 +68,7 @@ class SignalPanel(QtWidgets.QWidget):
             pen=pg.mkPen("#27ae60", width=2), name="ML corrected")
         self.curve_bpm_smooth = self.plot_bpm.plot(
             pen=pg.mkPen("#2980b9", width=2, style=QtCore.Qt.DashLine),
-            name="Smoothed (~5s, watch-style)")
+            name="Smoothed (~15s, watch-style)")
 
         graphs.addWidget(self.plot_raw, 2)
         graphs.addWidget(self.plot_proc, 2)

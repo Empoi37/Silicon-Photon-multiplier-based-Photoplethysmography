@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
-from scipy.signal import butter, detrend, find_peaks, sosfiltfilt
+from scipy.signal import butter, detrend, find_peaks, hilbert, sosfiltfilt
 
 from ml.hr_correction import HrCorrectionModel
 
@@ -65,6 +65,19 @@ def _detrend_channel(x: np.ndarray, fs: float) -> np.ndarray:
     return _bandpass(x, fs, 0.7, 4.0)
 
 
+def _mask_interp(x: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Interpolate over samples flagged `True` in `mask`, e.g. samples known
+    to have been captured during a hardware parameter change (see
+    PpgHrProcessor.mark_hw_change) -- a known-cause exclusion, unlike
+    _despike's statistical guess at which samples look wrong."""
+    if not np.any(mask) or np.all(mask):
+        return x
+    good = np.flatnonzero(~mask)
+    y = x.astype(float).copy()
+    y[mask] = np.interp(np.flatnonzero(mask), good, x[good])
+    return y
+
+
 def _despike(x: np.ndarray, sigma_limit: float = 5.0) -> np.ndarray:
     if len(x) < 8:
         return (x.copy())
@@ -84,6 +97,45 @@ def _despike(x: np.ndarray, sigma_limit: float = 5.0) -> np.ndarray:
         return np.clip(y, med - thr, med + thr)
     y[np.flatnonzero(bad)] = np.interp(np.flatnonzero(bad), good, y[good])
     return y
+
+
+def _envelope_normalize(x: np.ndarray, fs: float, cutoff_hz: float = 0.5) -> np.ndarray:
+    """Divide out slow (respiratory/vasomotor-timescale) amplitude
+    modulation before spectral peak-picking.
+
+    Respiration doesn't add a separate frequency component to worry about --
+    it's already below the 0.7Hz cardiac-band highpass -- it *modulates the
+    amplitude* of the cardiac signal (blood volume/vasomotor tone tracking
+    the breathing cycle), which shows up as sidebands around the true
+    cardiac peak in the FFT (at f_cardiac +/- f_respiratory) that can rival
+    or exceed it, especially at rest when the cardiac peak itself is
+    already modest. `x` should already be bandpassed to the cardiac band.
+
+    Uses the Hilbert transform's instantaneous amplitude as the envelope,
+    itself lowpassed well below the cardiac band so only the slow
+    (respiratory-timescale) modulation gets removed -- not beat-to-beat
+    envelope shape, which would destroy the cardiac signal this exists to
+    help isolate.
+    """
+    if len(x) < int(4 * fs):
+        return x
+    env = np.abs(hilbert(x))
+    nyq = 0.5 * fs
+    cutoff = min(cutoff_hz, 0.9 * nyq)
+    if cutoff <= 0:
+        return x
+    sos = butter(2, cutoff / nyq, btype="low", output="sos")
+    try:
+        env_slow = sosfiltfilt(sos, env)
+    except ValueError:
+        return x
+    mean_env = float(np.mean(env_slow))
+    if mean_env < 1e-9:
+        return x
+    # Floor the normalizer so a deep modulation trough doesn't blow up the
+    # signal amplitude there -- just damp the swing, don't invert it.
+    norm = np.maximum(env_slow / mean_env, 0.2)
+    return x / norm
 
 
 def _robust_pp(x: np.ndarray) -> float:
@@ -250,6 +302,19 @@ class PpgHrProcessor:
     max_amp_cv: float = 1.0
     correction_model: HrCorrectionModel | None = None
     use_ml_correction: bool = True
+    # Divide out slow respiratory/vasomotor amplitude modulation before FFT
+    # peak-picking -- see _envelope_normalize. Sound in theory (verified via
+    # a synthetic AM test: modulation depth 0.42 -> 0.009) and swept against
+    # PPG-DaLiA (3 subjects, cutoff_hz in {0.15, 0.2, 0.3, 0.4}) -- every
+    # cutoff made both resting and overall MAE *worse* than not normalizing
+    # at all (best case 4.95 -> 5.00 resting, 7.37 -> 7.59 overall at the
+    # tightest cutoff). Left off by default; the mechanism stays available
+    # to revisit (e.g. real PPG's non-sinusoidal beat shape -- sharp
+    # systolic upstroke + dicrotic notch -- may make the Hilbert envelope
+    # itself beat-shape-sensitive in a way the synthetic sine test didn't
+    # capture) but don't re-enable without new evidence it helps.
+    envelope_normalize: bool = False
+    envelope_cutoff_hz: float = 0.5
 
     _led1: list = field(default_factory=list)
     _led2: list = field(default_factory=list)
@@ -260,6 +325,13 @@ class PpgHrProcessor:
     _fs_dynamic: float = 0.0
     _bpm_ema: float = 0.0
     _bpm_initialized: bool = False
+    # (start_ts, end_ts) windows during which a hardware parameter (LED/gain/
+    # ADSGAIN) command was in flight -- see mark_hw_change(). Unlike detecting
+    # a saturation spike from the signal itself, these are known with
+    # certainty (we're the ones sending the command), so the affected samples
+    # get interpolated over directly instead of relying on the tracker to
+    # cope with whatever transient the change caused.
+    _hw_change_windows: list = field(default_factory=list)
 
     @property
     def fs(self) -> float:
@@ -271,6 +343,19 @@ class PpgHrProcessor:
         self._fs_dynamic = 0.0
         self._bpm_ema = 0.0
         self._bpm_initialized = False
+        self._hw_change_windows = []
+
+    def mark_hw_change(self, ts: float, settle_s: float = 0.3):
+        """Record that an LED/gain/ADSGAIN command was sent at `ts` -- the
+        samples captured during `settle_s` afterward get interpolated over
+        in compute() rather than fed to the tracker as-is. settle_s should
+        roughly cover the hardware's settling time for that parameter (TIA
+        gain settles slower than LED brightness -- tools/sweep_preset.py
+        documents this growing past 1s at high gain, so callers changing
+        gain/ADSGAIN should pass a larger settle_s than the LED default)."""
+        self._hw_change_windows.append((ts, ts + settle_s))
+        cutoff = ts - self.max_buffer_s
+        self._hw_change_windows = [w for w in self._hw_change_windows if w[1] >= cutoff]
 
     def push(self, led1, led2, ax=0, ay=0, az=0, ts=None):
         self._led1.append(float(led1))
@@ -288,7 +373,8 @@ class PpgHrProcessor:
         if len(self._t) < 16:
             return None
         t = np.asarray(self._t, dtype=float)
-        t -= t[0]
+        t0 = t[0]
+        t -= t0
         span = t[-1]
         if span <= 0:
             return None
@@ -307,7 +393,7 @@ class PpgHrProcessor:
 
         self._fs_dynamic = fs
         return (interp(self._led1), interp(self._led2),
-                interp(self._ax), interp(self._ay), interp(self._az), fs)
+                interp(self._ax), interp(self._ay), interp(self._az), fs, grid + t0)
 
     def _spectrum(self, x: np.ndarray):
         w = x - np.mean(x)
@@ -332,6 +418,8 @@ class PpgHrProcessor:
             w = _despike(c[-win_len:])
             if np.std(w) < 1e-9:
                 continue
+            if self.envelope_normalize:
+                w = _envelope_normalize(w, self.fs, self.envelope_cutoff_hz)
             fr, sp = self._spectrum(w)
             p = sp ** 2
             if spec is None:
@@ -425,9 +513,17 @@ class PpgHrProcessor:
         resampled = self._resample_uniform()
         if resampled is None:
             return None
-        l1, l2, rax, ray, raz, fs = resampled
+        l1, l2, rax, ray, raz, fs, grid_ts = resampled
         if len(l1) < int(1.5 * fs):
             return None
+
+        if self._hw_change_windows:
+            tainted = np.zeros(len(grid_ts), dtype=bool)
+            for start, end in self._hw_change_windows:
+                tainted |= (grid_ts >= start) & (grid_ts <= end)
+            if np.any(tainted):
+                l1 = _mask_interp(l1, tainted)
+                l2 = _mask_interp(l2, tainted)
 
         accel = np.column_stack([rax, ray, raz])
         accel_mag = np.sqrt(np.sum(accel ** 2, axis=1))

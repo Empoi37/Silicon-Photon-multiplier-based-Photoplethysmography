@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import queue
 import sys
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,44 @@ BPM_HISTORY_LEN = 600
 WATCH_AVG_SECONDS = 15.0
 WATCH_AVG_SAMPLES = int(WATCH_AVG_SECONDS * NOMINAL_FS)
 
+# AutoTuner decides a *target* LED/gain/ADSGAIN value every 500ms tick, but
+# sending that in one jump (e.g. a full led_step=8) is a sudden DC-level
+# change in the raw signal -- that step has broadband frequency content that
+# can pollute the tracker's whole 8s FFT window and cut BPM lock for as long
+# as the step sits inside it. _ParamRamp instead walks the *commanded* value
+# toward the target in small steps on a much faster timer, so the same
+# change (e.g. 8 counts) happens over several small hops in a few hundred ms
+# instead of a single instantaneous jump -- just as fast in wall-clock terms,
+# far gentler on the signal.
+RAMP_INTERVAL_MS = 40
+RAMP_STEP = 1
+
+
+class _ParamRamp:
+    """Walks a single hardware parameter toward a target value, one small
+    step per tick, instead of jumping there in one command."""
+
+    def __init__(self, apply):
+        self.value: int | None = None
+        self.target: int | None = None
+        self._apply = apply  # callable(int) -> sends the command(s) + updates UI
+
+    def sync(self, value: int):
+        self.value = self.target = int(value)
+
+    def set_target(self, value: int):
+        value = int(value)
+        if self.value is None:
+            self.value = value
+        self.target = value
+
+    def tick(self):
+        value, target = self.value, self.target
+        if value is None or target is None or value == target:
+            return
+        self.value = value + max(-RAMP_STEP, min(RAMP_STEP, target - value))
+        self._apply(self.value)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -121,6 +160,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.boost_opt = BoostOptimizer()
         self.boost_opt_enabled = False
 
+        self.led_ramp = _ParamRamp(self._apply_led)
+        self.gain_ramp = _ParamRamp(self._apply_gain)
+        self.adsgain_ramp = _ParamRamp(self._apply_adsgain)
+
         self._build_ui()
         self._wire_signals()
 
@@ -139,6 +182,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.agc_timer = QtCore.QTimer(self)
         self.agc_timer.timeout.connect(self._run_agc)
         self.agc_timer.start(500)
+
+        self.ramp_timer = QtCore.QTimer(self)
+        self.ramp_timer.timeout.connect(self._tick_ramps)
+        self.ramp_timer.start(RAMP_INTERVAL_MS)
 
     # ── Construction de l'UI ─────────────────────────────────────────────
 
@@ -183,7 +230,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recording_panel.startRequested.connect(self._start_recording)
         self.recording_panel.stopRequested.connect(self._stop_recording)
 
-        self.hardware_panel.commandIssued.connect(self._send)
+        self.hardware_panel.commandIssued.connect(self._on_manual_command)
         self.hardware_panel.hvToggled.connect(self._on_hv_toggled)
 
     # ── Connexion série ──────────────────────────────────────────────────
@@ -258,6 +305,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.reader:
             self.reader.send(text)
 
+    def _on_manual_command(self, cmd: str):
+        # A manual slider drag bypasses AutoTuner/the ramps entirely (goes
+        # straight to hardware, no need to gradually ramp a deliberate user
+        # action) -- but the ramps' internal state has to be kept in sync,
+        # or the next AGC tick's ramp would start from a stale value and
+        # fight the manual change.
+        self._send(cmd)
+        name, _, val = cmd.partition(":")
+        if name == "LED1":
+            self.led_ramp.sync(int(val))
+        elif name == "GAIN":
+            self.gain_ramp.sync(int(val))
+        elif name == "ADSGAIN":
+            self.adsgain_ramp.sync(int(val))
+
     def _on_hv_toggled(self, checked: bool):
         self._send(f"HVEN:{1 if checked else 0}")
 
@@ -272,11 +334,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 gain_tia=hw.sl_gain.slider.value(),
                 ads_gain=hw.sl_adsgain.slider.value(),
             )
+            self.led_ramp.sync(hw.sl_led1.slider.value())
+            self.gain_ramp.sync(hw.sl_gain.slider.value())
+            self.adsgain_ramp.sync(hw.sl_adsgain.slider.value())
 
     def _on_boost_opt_toggled(self, checked: bool):
         self.boost_opt_enabled = checked
         if checked:
             self.boost_opt.sync(self.hardware_panel.sl_boost.slider.value())
+
+    def _apply_led(self, value: int):
+        self._send(f"LED1:{value}")
+        self._send(f"LED2:{value}")
+        self.hardware_panel.sl_led1.set_silent(value)
+        self.hardware_panel.sl_led2.set_silent(value)
+        self.hr_proc.mark_hw_change(time.time())
+
+    def _apply_gain(self, value: int):
+        self._send(f"GAIN:{value}")
+        self.hardware_panel.sl_gain.set_silent(value)
+        # TIA gain settles slower than LED brightness (RC time constant,
+        # see control/agc.py's settle_ticks comment) -- give it more room.
+        self.hr_proc.mark_hw_change(time.time(), settle_s=0.6)
+
+    def _apply_adsgain(self, value: int):
+        self._send(f"ADSGAIN:{value}")
+        self.hardware_panel.sl_adsgain.set_silent(value)
+        self.hr_proc.mark_hw_change(time.time(), settle_s=0.6)
+
+    def _tick_ramps(self):
+        self.led_ramp.tick()
+        self.gain_ramp.tick()
+        self.adsgain_ramp.tick()
 
     def _run_agc(self):
         if self.reader is None:
@@ -300,19 +389,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         raw = np.fromiter(self.buf_ppg, dtype=float)[-int(1.5 * NOMINAL_FS):]
         cmds, reason = self.auto_tuner.step(
-            raw, valid=self.bpm_valid, ibi_cv=ibi_cv, amp_cv=amp_cv)
-        hw = self.hardware_panel
+            raw, valid=self.bpm_valid, ibi_cv=ibi_cv, amp_cv=amp_cv,
+            inband_snr=self.current_inband_snr)
+        # Don't send AutoTuner's target directly -- hand it to the matching
+        # ramp instead, which walks the actually-commanded value there in
+        # small steps (see _ParamRamp) rather than jumping in one shot.
         for cmd in cmds:
-            self._send(cmd)
             name, _, val = cmd.partition(":")
             val = int(val)
             if name == "GAIN":
-                hw.sl_gain.set_silent(val)
+                self.gain_ramp.set_target(val)
             elif name == "ADSGAIN":
-                hw.sl_adsgain.set_silent(val)
+                self.adsgain_ramp.set_target(val)
             elif name == "LED1":
-                hw.sl_led1.set_silent(val)
-                hw.sl_led2.set_silent(val)
+                self.led_ramp.set_target(val)
+            # LED2 always mirrors LED1 (AutoTuner emits both) -- one ramp
+            # target covers both via _apply_led.
         if reason:
             self.control_panel.set_auto_status(reason)
 
